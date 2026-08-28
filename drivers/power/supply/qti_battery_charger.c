@@ -981,7 +981,7 @@ static int battery_chg_callback(void *priv, void *data, size_t len)
 	down_read(&bcdev->state_sem);
 	if (!bcdev->initialized) {
 		pr_debug("Driver initialization failed: Dropping glink callback message: state %d\n",
-			 bcdev->state);
+			 atomic_read(&bcdev->state));
 		up_read(&bcdev->state_sem);
 		return 0;
 	}
