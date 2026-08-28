@@ -276,8 +276,10 @@ struct battery_chg_dev {
 	u32				wls_fw_update_time_ms;
 	struct notifier_block		reboot_notifier;
 	u32				thermal_fcc_ua;
+	u32				mz_fcc_ua;
 	u32				restrict_fcc_ua;
 	u32				last_fcc_ua;
+	unsigned long			mz_fcc_ma;
 	u32				usb_icl_ua[NUM_USB_PORTS];
 	u32				thermal_fcc_step;
 	bool				restrict_chg_en;
@@ -1363,10 +1365,10 @@ static int __battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 {
 	int rc;
 
-	if (bcdev->restrict_chg_en) {
+	fcc_ua = min_t(u32, fcc_ua, bcdev->thermal_fcc_ua);
+	fcc_ua = min_t(u32, fcc_ua, bcdev->mz_fcc_ua);
+	if (bcdev->restrict_chg_en)
 		fcc_ua = min_t(u32, fcc_ua, bcdev->restrict_fcc_ua);
-		fcc_ua = min_t(u32, fcc_ua, bcdev->thermal_fcc_ua);
-	}
 
 	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
 				BATT_CHG_CTRL_LIM, fcc_ua);
@@ -2067,7 +2069,8 @@ static ssize_t restrict_cur_store(struct class *c, struct class_attribute *attr,
 	int rc;
 	u32 fcc_ua, prev_fcc_ua;
 
-	if (kstrtou32(buf, 0, &fcc_ua) || fcc_ua > bcdev->thermal_fcc_ua)
+	if (kstrtou32(buf, 0, &fcc_ua) ||
+	    fcc_ua > min(bcdev->thermal_fcc_ua, bcdev->mz_fcc_ua))
 		return -EINVAL;
 
 	prev_fcc_ua = bcdev->restrict_fcc_ua;
@@ -2423,6 +2426,8 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 
 	bcdev->num_thermal_levels = len;
 	bcdev->thermal_fcc_ua = pst->prop[BATT_CHG_CTRL_LIM_MAX];
+	bcdev->mz_fcc_ua = pst->prop[BATT_CHG_CTRL_LIM_MAX];
+	bcdev->mz_fcc_ma = bcdev->mz_fcc_ua / 1000;
 
 	return 0;
 }
@@ -2571,12 +2576,68 @@ static const struct thermal_cooling_device_ops battery_tcd_ops = {
 	.set_cur_state = battery_chg_set_cur_charge_cntl_limit,
 };
 
+static int mz_chg_get_max_fcc_limit(struct thermal_cooling_device *tcd,
+				    unsigned long *state)
+{
+	struct battery_chg_dev *bcdev = tcd->devdata;
+
+	*state = bcdev->psy_list[PSY_TYPE_BATTERY].prop[BATT_CHG_CTRL_LIM_MAX] /
+			1000;
+
+	return 0;
+}
+
+static int mz_chg_get_fcc_limit(struct thermal_cooling_device *tcd,
+				unsigned long *state)
+{
+	struct battery_chg_dev *bcdev = tcd->devdata;
+
+	*state = bcdev->mz_fcc_ma;
+
+	return 0;
+}
+
+static int mz_chg_set_fcc_limit(struct thermal_cooling_device *tcd,
+				unsigned long state)
+{
+	struct battery_chg_dev *bcdev = tcd->devdata;
+	unsigned long max_state;
+	unsigned long prev_state;
+	u32 prev_fcc_ua;
+	int rc;
+
+	mz_chg_get_max_fcc_limit(tcd, &max_state);
+	if (state > max_state)
+		return -EINVAL;
+	if (!state)
+		state = max_state;
+
+	prev_state = bcdev->mz_fcc_ma;
+	prev_fcc_ua = bcdev->mz_fcc_ua;
+	bcdev->mz_fcc_ma = state;
+	bcdev->mz_fcc_ua = state * 1000;
+
+	rc = __battery_psy_set_charge_current(bcdev, bcdev->mz_fcc_ua);
+	if (rc) {
+		bcdev->mz_fcc_ma = prev_state;
+		bcdev->mz_fcc_ua = prev_fcc_ua;
+	}
+
+	return rc;
+}
+
+static const struct thermal_cooling_device_ops mz_chg_tcd_ops = {
+	.get_max_state = mz_chg_get_max_fcc_limit,
+	.get_cur_state = mz_chg_get_fcc_limit,
+	.set_cur_state = mz_chg_set_fcc_limit,
+};
+
 static int battery_chg_probe(struct platform_device *pdev)
 {
 	struct battery_chg_dev *bcdev;
 	struct device *dev = &pdev->dev;
 	struct pmic_glink_client_data client_data = { };
-	struct thermal_cooling_device *tcd;
+	struct thermal_cooling_device *tcd, *mz_tcd;
 	struct psy_state *pst;
 	int rc, i;
 
@@ -2695,6 +2756,16 @@ static int battery_chg_probe(struct platform_device *pdev)
 	if (IS_ERR_OR_NULL(tcd)) {
 		rc = PTR_ERR_OR_ZERO(tcd);
 		dev_err(dev, "Failed to register thermal cooling device rc=%d\n",
+			rc);
+		class_unregister(&bcdev->battery_class);
+		goto error;
+	}
+
+	mz_tcd = devm_thermal_of_cooling_device_register(dev, NULL,
+							 "mz_chg", bcdev, &mz_chg_tcd_ops);
+	if (IS_ERR_OR_NULL(mz_tcd)) {
+		rc = PTR_ERR_OR_ZERO(mz_tcd);
+		dev_err(dev, "Failed to register mz_chg cooling device rc=%d\n",
 			rc);
 		class_unregister(&bcdev->battery_class);
 		goto error;
