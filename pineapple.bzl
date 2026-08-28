@@ -1,6 +1,8 @@
 load(":image_opts.bzl", "boot_image_opts")
+load(":modules.bzl", "COMMON_GKI_MODULES_LIST")
 load(":msm_kernel_la.bzl", "define_msm_la")
 load(":target_variants.bzl", "la_variants")
+load("//vendor/meizu/opensource/kernel-modules:public_modules.bzl", "MEIZU21PRO_PUBLIC_IN_TREE_MODULES")
 
 target_name = "pineapple"
 
@@ -322,7 +324,11 @@ def define_pineapple():
         if variant == "consolidate":
             mod_list = _pineapple_consolidate_in_tree_modules
         else:
-            mod_list = _pineapple_in_tree_modules
+            mod_list = _pineapple_in_tree_modules + [
+                module
+                for module in MEIZU21PRO_PUBLIC_IN_TREE_MODULES
+                if module not in _pineapple_in_tree_modules and module not in COMMON_GKI_MODULES_LIST
+            ]
             board_kernel_cmdline_extras += ["nosoftlockup"]
             kernel_vendor_cmdline_extras += ["nosoftlockup"]
             board_bootconfig_extras += ["androidboot.console=0"]
