@@ -7,6 +7,7 @@ obj-$(CONFIG_PHY_QCOM_IPQ806X_SATA)	+= phy-qcom-ipq806x-sata.o
 obj-$(CONFIG_PHY_QCOM_PCIE2)		+= phy-qcom-pcie2.o
 obj-$(CONFIG_PHY_QCOM_UFS)		+= phy-qcom-ufs.o
 obj-$(CONFIG_PHY_QCOM_UFS_V4)		+= phy-qcom-ufs-qmp-v4.o
+obj-$(CONFIG_PHY_QCOM_UFS_V4_KALAMA)	+= phy-qcom-ufs-qmp-v4-kalama.o
 obj-$(CONFIG_PHY_QCOM_UFS_V3)           += phy-qcom-ufs-qmp-v3-660.o
 obj-$(CONFIG_PHY_QCOM_UFS_V4_PINEAPPLE)	+= phy-qcom-ufs-qmp-v4-pineapple.o
 obj-$(CONFIG_PHY_QCOM_UFS_V4_NIOBE)	+= phy-qcom-ufs-qmp-v4-niobe.o
