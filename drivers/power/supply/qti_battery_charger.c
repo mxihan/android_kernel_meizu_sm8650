@@ -57,6 +57,7 @@
 #define WLS_FW_UPDATE_TIME_MS		1000
 #define WLS_FW_BUF_SIZE			128
 #define DEFAULT_RESTRICT_FCC_UA		1000000
+#define MZ_WLS_REV_CHG_STAT		33
 
 enum usb_port_id {
 	USB_1_PORT_ID,
@@ -270,6 +271,12 @@ struct battery_chg_dev {
 	bool				ship_mode_en;
 	bool				debug_battery_detected;
 	bool				wls_not_supported;
+	bool				mz_wls_reverse_supported;
+	int				mz_wls_boost_state;
+	int				mz_wls_reverse_state;
+	atomic_t			mz_wls_reverse_epoch;
+	struct mutex			mz_wls_reverse_lock;
+	struct completion		mz_wls_reverse_ack;
 	bool				wls_fw_update_reqd;
 	u32				wls_fw_version;
 	u16				wls_fw_crc;
@@ -405,6 +412,8 @@ static int battery_chg_fw_write(struct battery_chg_dev *bcdev, void *data,
 static int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
 				int len)
 {
+	struct battery_charger_req_msg *req_msg = data;
+	struct completion *ack = &bcdev->ack;
 	int rc;
 
 	/*
@@ -425,11 +434,15 @@ static int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
 	}
 
 	mutex_lock(&bcdev->rw_lock);
-	reinit_completion(&bcdev->ack);
+	if (bcdev->mz_wls_reverse_supported && len == sizeof(*req_msg) &&
+	    req_msg->hdr.opcode == BC_WLS_STATUS_GET &&
+	    req_msg->property_id == MZ_WLS_REV_CHG_STAT)
+		ack = &bcdev->mz_wls_reverse_ack;
+	reinit_completion(ack);
 	bcdev->error_prop = false;
 	rc = pmic_glink_write(bcdev->client, data, len);
 	if (!rc) {
-		rc = wait_for_completion_timeout(&bcdev->ack,
+		rc = wait_for_completion_timeout(ack,
 					msecs_to_jiffies(BC_WAIT_TIME_MS));
 		if (!rc) {
 			pr_err("Error, timed out sending message\n");
@@ -560,6 +573,8 @@ static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
 		up_write(&bcdev->state_sem);
 		return;
 	}
+	if (bcdev->mz_wls_reverse_supported)
+		atomic_inc(&bcdev->mz_wls_reverse_epoch);
 	atomic_set(&bcdev->state, state);
 	up_write(&bcdev->state_sem);
 
@@ -567,6 +582,10 @@ static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
 		schedule_work(&bcdev->subsys_up_work);
 	else if (state == PMIC_GLINK_STATE_DOWN)
 		bcdev->notify_en = false;
+
+	if (bcdev->mz_wls_reverse_supported &&
+	    bcdev->psy_list[PSY_TYPE_WLS].psy)
+		power_supply_changed(bcdev->psy_list[PSY_TYPE_WLS].psy);
 }
 
 /**
@@ -696,11 +715,22 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 
 		break;
 	case BC_WLS_STATUS_GET:
+		if (bcdev->mz_wls_reverse_supported && len == sizeof(*resp_msg) &&
+		    resp_msg->property_id == MZ_WLS_REV_CHG_STAT) {
+			WRITE_ONCE(bcdev->mz_wls_reverse_state,
+				   resp_msg->ret_code ? -ENODATA : (int)resp_msg->value);
+			complete(&bcdev->mz_wls_reverse_ack);
+			return;
+		}
 		pst = &bcdev->psy_list[PSY_TYPE_WLS];
-		if (validate_message(bcdev, resp_msg, len) &&
-		    resp_msg->property_id < pst->prop_count) {
-			pst->prop[resp_msg->property_id] = resp_msg->value;
-			ack_set = true;
+		if (validate_message(bcdev, resp_msg, len)) {
+			if (resp_msg->property_id < pst->prop_count) {
+				pst->prop[resp_msg->property_id] = resp_msg->value;
+				if (bcdev->mz_wls_reverse_supported &&
+				    resp_msg->property_id == WLS_BOOST_EN)
+					WRITE_ONCE(bcdev->mz_wls_boost_state, resp_msg->value);
+				ack_set = true;
+			}
 		}
 
 		break;
@@ -2151,6 +2181,56 @@ static ssize_t wireless_boost_en_store(struct class *c,
 
 QTI_CHARGER_RW_SHOW(wireless_boost_en, PSY_TYPE_WLS, WLS_BOOST_EN);
 
+static ssize_t reverse_chg_state_show(struct class *c,
+				    struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						   battery_class);
+	int rc, boost, epoch, state = -1;
+
+	if (!bcdev->mz_wls_reverse_supported)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&bcdev->mz_wls_reverse_lock);
+	epoch = atomic_read(&bcdev->mz_wls_reverse_epoch);
+	if (atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP ||
+	    (bcdev->debug_battery_detected && bcdev->block_tx)) {
+		rc = -ENOTCONN;
+		goto out;
+	}
+	WRITE_ONCE(bcdev->mz_wls_boost_state, -1);
+	rc = read_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_WLS], WLS_BOOST_EN);
+	if (rc)
+		goto out;
+	boost = READ_ONCE(bcdev->mz_wls_boost_state);
+	if (boost < 0 || boost > 1) {
+		rc = -ENODATA;
+		goto out;
+	}
+	if (!boost) {
+		state = 0;
+		goto out;
+	}
+	WRITE_ONCE(bcdev->mz_wls_reverse_state, -1);
+	rc = read_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_WLS],
+			      MZ_WLS_REV_CHG_STAT);
+	state = READ_ONCE(bcdev->mz_wls_reverse_state);
+out:
+	if (!rc && (epoch != atomic_read(&bcdev->mz_wls_reverse_epoch) ||
+		    atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP ||
+		    (bcdev->debug_battery_detected && bcdev->block_tx)))
+		rc = -ENOTCONN;
+	mutex_unlock(&bcdev->mz_wls_reverse_lock);
+	if (rc)
+		return rc;
+	if (state < 0)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%d\n", state == 6 ? 2 :
+			  (state == 1 || state == 2 ? 1 : 0));
+}
+static CLASS_ATTR_RO(reverse_chg_state);
+
 static ssize_t _moisture_detection_en_store(struct class *c,
 					struct class_attribute *attr, enum psy_type type,
 					const char *buf, size_t count)
@@ -2225,6 +2305,7 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_moisture_detection_status.attr,
 	&class_attr_moisture_detection_en.attr,
 	&class_attr_wireless_boost_en.attr,
+	&class_attr_reverse_chg_state.attr,
 	&class_attr_fake_soc.attr,
 	&class_attr_wireless_fw_update.attr,
 	&class_attr_wireless_fw_force_update.attr,
@@ -2251,6 +2332,7 @@ static struct attribute *battery_class_usb_2_attrs[] = {
 	&class_attr_moisture_detection_en.attr,
 	&class_attr_moisture_detection_usb_2_en.attr,
 	&class_attr_wireless_boost_en.attr,
+	&class_attr_reverse_chg_state.attr,
 	&class_attr_fake_soc.attr,
 	&class_attr_wireless_fw_update.attr,
 	&class_attr_wireless_fw_force_update.attr,
@@ -2339,6 +2421,8 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 
 	bcdev->wls_not_supported = of_property_read_bool(node,
 			"qcom,wireless-charging-not-supported");
+	bcdev->mz_wls_reverse_supported = of_property_read_bool(node,
+			"meizu,wireless-reverse-status");
 
 	of_property_read_string(node, "qcom,wireless-fw-name",
 				&bcdev->wls_fw_name);
@@ -2678,6 +2762,9 @@ static int battery_chg_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&bcdev->rw_lock);
+	mutex_init(&bcdev->mz_wls_reverse_lock);
+	atomic_set(&bcdev->mz_wls_reverse_epoch, 0);
+	init_completion(&bcdev->mz_wls_reverse_ack);
 	init_rwsem(&bcdev->state_sem);
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
