@@ -757,6 +757,12 @@ static struct clk_rcg2 gcc_cpuss_ubwcp_clk_src = {
 };
 
 static const struct freq_tbl ftbl_gcc_gp1_clk_src[] = {
+	/* Meizu GPIO88 IR carrier, sourced from the 19.2 MHz TCXO. */
+	F(36000, P_BI_TCXO, 4, 1, 133),
+	F(38000, P_BI_TCXO, 4, 1, 126),
+	F(39500, P_BI_TCXO, 4, 79, 9600),
+	F(40000, P_BI_TCXO, 4, 1, 120),
+	F(56000, P_BI_TCXO, 4, 7, 600),
 	F(50000000, P_GCC_GPLL0_OUT_EVEN, 6, 0, 0),
 	F(100000000, P_GCC_GPLL0_OUT_MAIN, 6, 0, 0),
 	F(200000000, P_GCC_GPLL0_OUT_MAIN, 3, 0, 0),
